@@ -1,0 +1,12 @@
+[package]
+authors = ["Augustus Mayo <gusmayo@gmail.com>"]
+name = "sf_client"
+version = "0.1.0"
+
+[dependencies]
+reqwest = "0.6.2"
+serde = "1.0.8"
+serde_derive = "1.0.8"
+
+[dev-dependencies]
+mockito = "0.5.0"
