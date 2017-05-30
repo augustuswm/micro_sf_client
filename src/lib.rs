@@ -1,12 +1,21 @@
+#[cfg(test)]
+extern crate mockito;
 extern crate reqwest;
 extern crate serde;
 #[macro_use]
 extern crate serde_derive;
+#[macro_use]
+extern crate serde_json;
 
 use reqwest::{Client, Error as ClientError, RequestBuilder, StatusCode};
-use reqwest::header::Authorization;
+use reqwest::header::{Authorization, Bearer};
+use serde_json::map::Map;
+use serde_json::Value;
 
 use std::collections::HashMap;
+use std::io::Read;
+
+static API_BASE: &'static str = "services/data/v20.0/";
 
 #[derive(Debug)]
 pub struct SFClient {
@@ -21,7 +30,7 @@ pub struct SFClient {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct Token {
+pub struct Token {
     access_token: String,
     token_type: String,
     instance_url: String,
@@ -35,7 +44,12 @@ struct TokenError {
     error_description: String,
 }
 
-pub struct QueryResponse {}
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct QueryResponse {
+    total_size: u8,
+    done: bool,
+    records: Vec<Value>,
+}
 
 impl SFClient {
     pub fn new(login_url: &str,
@@ -70,28 +84,34 @@ impl SFClient {
         self
     }
 
+    pub fn token(&self) -> &Option<Token> {
+        &self.token
+    }
+
+    fn build_auth_request(&mut self) -> RequestBuilder {
+        let mut auth_params = HashMap::new();
+        auth_params.insert("grant_type", "password");
+        auth_params.insert("client_id", self.client_id.as_str());
+        auth_params.insert("client_secret", self.client_secret.as_str());
+        auth_params.insert("username", self.username.as_str());
+        auth_params.insert("password", self.password.as_str());
+
+        self.client.post(self.login_url.as_str()).form(&auth_params)
+    }
+
     fn authenticate(&mut self) -> SFClientResult<()> {
-        let auth = {
-            let mut auth_params = HashMap::new();
-            auth_params.insert("grant_type", "password");
-            auth_params.insert("client_id", self.client_id.as_str());
-            auth_params.insert("client_secret", self.client_secret.as_str());
-            auth_params.insert("username", self.username.as_str());
-            auth_params.insert("password", self.password.as_str());
+        let mut response = self.build_auth_request()
+            .send()
+            .map_err(SFClientError::Network)?;
 
-            self.client
-                .post(self.login_url.as_str())
-                .form(&auth_params)
-                .send()
-        };
+        let mut content = String::new();
+        response.read_to_string(&mut content);
 
-        let mut response = auth.map_err(SFClientError::Network)?;
-
-        if let Ok(token) = response.json::<Token>() {
+        if let Ok(token) = serde_json::from_str::<Token>(content.as_str()) {
             self.token = Some(token);
             Ok(())
-        } else if let Ok(token_error) = response.json::<TokenError>() {
-            Err(match token_error.error_description.as_str() {
+        } else if let Ok(token_error) = serde_json::from_str::<TokenError>(content.as_str()) {
+            Err(match token_error.error.as_str() {
                     "invalid_client_id" => SFClientError::InvalidClientId,
                     "invalid_client_credentials" => SFClientError::InvalidClientSecret,
                     "invalid_grant" => SFClientError::InvalidGrant,
@@ -111,11 +131,11 @@ impl SFClient {
         };
 
         if let Some(ref token) = self.token {
-            let url = token.instance_url.to_owned() + "query?q=" + query;
+            let url = token.instance_url.to_owned() + API_BASE + "query?q=" + query;
 
             Ok(self.client
                    .get(url.as_str())
-                   .header(Authorization(token.access_token.clone())))
+                   .header(Authorization(Bearer { token: token.access_token.to_string() })))
         } else {
             Err(SFClientError::TokenUnavailable)
         }
@@ -124,8 +144,12 @@ impl SFClient {
     fn do_query(&mut self, query: &str) -> SFClientResult<QueryResponse> {
         self.build_request(query)
             .and_then(|request| request.send().map_err(SFClientError::Network))
-            .and_then(|response| match *response.status() {
-                          StatusCode::Ok => Ok(QueryResponse {}),
+            .and_then(|mut response| match *response.status() {
+                          StatusCode::Ok => {
+                              response
+                                  .json::<QueryResponse>()
+                                  .or_else(|_| Err(SFClientError::QueryFailure))
+                          }
                           _ => Err(SFClientError::QueryFailure),
                       })
     }
@@ -188,9 +212,105 @@ pub enum SFClientError {
 
 #[cfg(test)]
 mod tests {
+    use mockito;
+    use mockito::{mock, Mock};
+    use serde_json;
 
+    use API_BASE;
+    use QueryResponse;
     use SFClient;
     use SFClientError;
+
+    const ACCESS: &'static str = "00Dx0000000BV7z!AR8AQAxo9UfVkh8AlV0Gomt9Czx9LjHnSSpwBMmbRcgKFmxOtvxjTrKW19ye6PE3Ds1eQz3z8jr3W7_VbWmEu4Q8TVGSTHxs";
+
+    fn auth_path(path: &str) -> String {
+        "/mock_auth_url/".to_owned() + path
+    }
+
+    fn auth_url(path: &str) -> String {
+        mockito::SERVER_URL.to_owned() + auth_path(path).as_str()
+    }
+
+    fn auth_mock(url: &str, code: usize, body: &str) -> Mock {
+        let mut m = mock("POST", url);
+        m.with_status(code)
+            .with_body(body)
+            .match_header("content-type", "application/x-www-form-urlencoded");
+        m
+    }
+
+    fn auth_err(err: &str) -> String {
+        let resp = json!({
+            "error": err,
+            "error_description": "mock error"
+        });
+
+        resp.to_string()
+    }
+
+    fn auth_success() -> String {
+        let resp = json!({
+            "id": mockito::SERVER_URL.to_owned() + "/id/",
+            "issued_at": "1278448832702",
+            "instance_url": mockito::SERVER_URL.to_owned() + "/instance/",
+            "signature": "0CmxinZir53Yex7nE0TD+zMpvIWYGb/bdJh6XfOH6EQ=",
+            "access_token": ACCESS,
+            "token_type": "Bearer"
+        });
+
+        resp.to_string()
+    }
+
+    macro_rules! auth_fail_test {
+        ( $error:expr, $error_value:pat, $error_msg:expr ) => {
+            let mut mock = auth_mock(auth_path($error).as_str(), 200, auth_err($error).as_str());
+            mock.create();
+
+            let mut client = SFClient::new(
+                auth_url($error).as_str(),
+                "id",
+                "secret",
+                "user",
+                "pass"
+            ).unwrap().attempt_limit(0);
+
+            match client.query("") {
+                $error_value => (),
+                _ => panic!($error_msg),
+            }
+
+            mock.remove();
+        }
+    }
+
+    fn query_path(path: &str) -> String {
+        "/instance/".to_owned() + API_BASE + "query?q=" + path
+    }
+
+    fn query_url(path: &str) -> String {
+        mockito::SERVER_URL.to_owned() + query_path(path).as_str()
+    }
+
+    fn query_mock(url: &str, code: usize, body: &str) -> Mock {
+        let mut m = mock("GET", url);
+        let auth_header = "Bearer ".to_owned() + ACCESS;
+        m.with_status(code)
+            .with_body(body)
+            .match_header("Authorization", auth_header.as_str());
+        m
+    }
+
+    fn query_success() -> String {
+        let resp = json!({
+            "total_size": 1,
+            "done": true,
+            "records": [
+                {"id": "12345"}
+            ]
+        });
+
+        resp.to_string()
+    }
 
     #[test]
     fn test_requires_login_url() {
@@ -202,43 +322,87 @@ mod tests {
 
     #[test]
     fn test_auth_handles_invalid_client_id() {
-        // "invalid_client_id" => SFClientError::InvalidClientId,
-        unimplemented!()
+        auth_fail_test!(
+            "invalid_client_id",
+            Err(SFClientError::InvalidClientId),
+            "Failed to handle invalid_client_id"
+        );
     }
 
     #[test]
     fn test_auth_handles_invalid_client_secret() {
-        // "invalid_client_credentials" => SFClientError::InvalidClientSecret,
-        unimplemented!()
+        auth_fail_test!(
+            "invalid_client_credentials",
+            Err(SFClientError::InvalidClientSecret),
+            "Failed to handle invalid_client_credentials"
+        );
     }
 
     #[test]
     fn test_auth_handles_invalid_grant() {
-        // "invalid_grant" => SFClientError::InvalidGrant,
-        unimplemented!()
+        auth_fail_test!(
+            "invalid_grant",
+            Err(SFClientError::InvalidGrant),
+            "Failed to handle invalid_grant"
+        );
     }
 
     #[test]
     fn test_auth_handles_inactive_user() {
-        // "inactive_user" => SFClientError::InvalidUser,
-        unimplemented!()
+        auth_fail_test!(
+            "inactive_user",
+            Err(SFClientError::InvalidUser),
+            "Failed to handle inactive_user"
+        );
     }
 
     #[test]
     fn test_auth_handles_inactive_org() {
-        // "inactive_org" => SFClientError::OrgUnavailable,
-        unimplemented!()
+        auth_fail_test!(
+            "inactive_org",
+            Err(SFClientError::OrgUnavailable),
+            "Failed to handle inactive_org"
+        );
     }
 
     #[test]
     fn test_auth_handles_rate_limit_exceeded() {
-        // "rate_limit_exceeded" => SFClientError::RateLimitExceeded,
-        unimplemented!()
+        auth_fail_test!(
+            "rate_limit_exceeded",
+            Err(SFClientError::RateLimitExceeded),
+            "Failed to handle rate_limit_exceeded"
+        );
     }
 
     #[test]
     fn test_authenticates_without_token() {
-        unimplemented!()
+        let mut a_mock = auth_mock(auth_path("first_token").as_str(),
+                                   200,
+                                   auth_success().as_str());
+        a_mock.create();
+
+        let mut q_mock = query_mock(query_path("first_token").as_str(),
+                                    200,
+                                    query_success().as_str());
+        q_mock.create();
+
+        let mut client = SFClient::new(auth_url("first_token").as_str(),
+                                       "id",
+                                       "secret",
+                                       "user",
+                                       "pass")
+                .unwrap()
+                .attempt_limit(0);
+
+        match client.query("first_token") {
+            Ok(result) => {
+                assert_eq!(serde_json::from_str::<QueryResponse>(query_success().as_str()).unwrap(), result)
+            }
+            Err(_) => panic!("Without token query failed"),
+        };
+
+        a_mock.remove();
+        q_mock.remove();
     }
 
     #[test]
