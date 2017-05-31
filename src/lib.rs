@@ -144,14 +144,17 @@ impl SFClient {
     fn do_query(&mut self, query: &str) -> SFClientResult<QueryResponse> {
         self.build_request(query)
             .and_then(|request| request.send().map_err(SFClientError::Network))
-            .and_then(|mut response| match *response.status() {
-                          StatusCode::Ok => {
-                              response
-                                  .json::<QueryResponse>()
-                                  .or_else(|_| Err(SFClientError::QueryFailure))
-                          }
-                          _ => Err(SFClientError::QueryFailure),
-                      })
+            .and_then(|mut response| {
+                println!("{:?}", response);
+                match *response.status() {
+                    StatusCode::Ok => {
+                        response
+                            .json::<QueryResponse>()
+                            .or_else(|_| Err(SFClientError::QueryResponseParseFailure))
+                    }
+                    _ => Err(SFClientError::QueryFailure),
+                }
+            })
     }
 
     fn attempt_query(&mut self, query: &str, attempt: u8) -> SFClientResult<QueryResponse> {
@@ -207,6 +210,7 @@ pub enum SFClientError {
     OrgUnavailable,
     RateLimitExceeded,
     QueryFailure,
+    QueryResponseParseFailure,
     Network(ClientError),
 }
 
@@ -223,6 +227,18 @@ mod tests {
 
     const ACCESS: &'static str = "00Dx0000000BV7z!AR8AQAxo9UfVkh8AlV0Gomt9Czx9LjHnSSpwBMmbRcgKFmxOtvxjTrKW19ye6PE3Ds1eQz3z8jr3W7_VbWmEu4Q8TVGSTHxs";
 
+    macro_rules! test_client {
+        ( $login_url:expr ) => {
+            SFClient::new(
+                $login_url.as_str(),
+                "id",
+                "secret",
+                "user",
+                "pass"
+            ).unwrap().attempt_limit(0)
+        }
+    }
+
     fn auth_path(path: &str) -> String {
         "/mock_auth_url/".to_owned() + path
     }
@@ -231,10 +247,10 @@ mod tests {
         mockito::SERVER_URL.to_owned() + auth_path(path).as_str()
     }
 
-    fn auth_mock(url: &str, code: usize, body: &str) -> Mock {
-        let mut m = mock("POST", url);
+    fn auth_mock(url: String, code: usize, body: String) -> Mock {
+        let mut m = mock("POST", url.as_str());
         m.with_status(code)
-            .with_body(body)
+            .with_body(body.as_str())
             .match_header("content-type", "application/x-www-form-urlencoded");
         m
     }
@@ -263,16 +279,10 @@ mod tests {
 
     macro_rules! auth_fail_test {
         ( $error:expr, $error_value:pat, $error_msg:expr ) => {
-            let mut mock = auth_mock(auth_path($error).as_str(), 200, auth_err($error).as_str());
+            let mut mock = auth_mock(auth_path($error), 200, auth_err($error));
             mock.create();
 
-            let mut client = SFClient::new(
-                auth_url($error).as_str(),
-                "id",
-                "secret",
-                "user",
-                "pass"
-            ).unwrap().attempt_limit(0);
+            let mut client = test_client!(auth_url($error));
 
             match client.query("") {
                 $error_value => (),
@@ -284,18 +294,18 @@ mod tests {
     }
 
     fn query_path(path: &str) -> String {
-        "/instance/".to_owned() + API_BASE + "query?q=" + path
+        "/instance/".to_owned() + API_BASE + "query\\?q=" + path
     }
 
     fn query_url(path: &str) -> String {
         mockito::SERVER_URL.to_owned() + query_path(path).as_str()
     }
 
-    fn query_mock(url: &str, code: usize, body: &str) -> Mock {
-        let mut m = mock("GET", url);
+    fn query_mock(url: String, code: usize, body: String) -> Mock {
+        let mut m = mock("GET", url.as_str());
         let auth_header = "Bearer ".to_owned() + ACCESS;
         m.with_status(code)
-            .with_body(body)
+            .with_body(body.as_str())
             .match_header("Authorization", auth_header.as_str());
         m
     }
@@ -376,33 +386,24 @@ mod tests {
 
     #[test]
     fn test_authenticates_without_token() {
-        let mut a_mock = auth_mock(auth_path("first_token").as_str(),
-                                   200,
-                                   auth_success().as_str());
+        let mut a_mock = auth_mock(auth_path("without_token"), 200, auth_success());
         a_mock.create();
 
-        let mut q_mock = query_mock(query_path("first_token").as_str(),
-                                    200,
-                                    query_success().as_str());
+        let mut q_mock = query_mock(query_path("without_token"), 200, query_success());
         q_mock.create();
 
-        let mut client = SFClient::new(auth_url("first_token").as_str(),
-                                       "id",
-                                       "secret",
-                                       "user",
-                                       "pass")
-                .unwrap()
-                .attempt_limit(0);
-
-        match client.query("first_token") {
-            Ok(result) => {
-                assert_eq!(serde_json::from_str::<QueryResponse>(query_success().as_str()).unwrap(), result)
-            }
-            Err(_) => panic!("Without token query failed"),
-        };
+        let mut client = test_client!(auth_url("without_token"));
+        let res = client.query("without_token");
 
         a_mock.remove();
         q_mock.remove();
+
+        match res {
+            Ok(result) => {
+                assert_eq!(serde_json::from_str::<QueryResponse>(query_success().as_str()).unwrap(), result)
+            }
+            Err(err) => panic!("Without token query failed {:?}", err),
+        };
     }
 
     #[test]
@@ -422,11 +423,35 @@ mod tests {
 
     #[test]
     fn test_token_access() {
-        unimplemented!()
+        let mut a_mock = auth_mock(auth_path("token_access"), 200, auth_success());
+        a_mock.create();
+
+        let mut q_mock = query_mock(query_path("token_access"), 200, query_success());
+        q_mock.create();
+
+        let mut client = test_client!(auth_url("token_access"));
+        client.query("token_access");
+
+        a_mock.remove();
+        q_mock.remove();
+
+        assert_eq!(ACCESS, client.token.unwrap().token());
     }
 
     #[test]
     fn test_token_url() {
-        unimplemented!()
+        let mut a_mock = auth_mock(auth_path("token_url"), 200, auth_success());
+        a_mock.create();
+
+        let mut q_mock = query_mock(query_path("token_url"), 200, query_success());
+        q_mock.create();
+
+        let mut client = test_client!(auth_url("token_url"));
+        client.query("token_url");
+
+        a_mock.remove();
+        q_mock.remove();
+
+        assert_eq!("http://127.0.0.1:1234/instance/", client.token.unwrap().url());
     }
 }
