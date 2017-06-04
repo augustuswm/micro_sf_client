@@ -10,4 +10,4 @@ serde_derive = "1.0.8"
 serde_json = "1.0.2"
 
 [dev-dependencies]
-mockito = { git = "https://github.com/augustuswm/mockito.git" }
+mockito = { git = "https://github.com/lipanski/mockito.git", rev = "ccf838d45a3bc8e9b09fc88a69de790a50bab035" }
