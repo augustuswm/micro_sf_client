@@ -1,0 +1,12 @@
+machine:
+  pre:
+    - sed -i 's/github/git-non-exist-hub/g' ~/.gitconfig
+    - curl -L https://sh.rustup.rs | sh -s -- -y
+
+  environment:
+    PATH: ${HOME}/.cargo/bin:${PATH}
+
+test:
+  override:
+    - case $CIRCLE_NODE_INDEX in 0) cargo build --release ;; 1) cargo test ;; esac:
+        parallel: true
