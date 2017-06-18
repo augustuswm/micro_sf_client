@@ -7,10 +7,13 @@ extern crate serde_derive;
 #[macro_use]
 extern crate serde_json;
 
-use reqwest::{Client, Error as ClientError};
-
 mod query;
 mod token;
+
+use std::error::Error;
+use std::fmt;
+
+use reqwest::{Client, Error as ClientError};
 
 use query::{QueryError, QueryRequest, QueryResponse};
 use token::{TokenError, TokenRequest, TokenResponse};
@@ -29,13 +32,14 @@ pub struct SFClient {
 }
 
 impl SFClient {
-    pub fn new<S: Into<String>>(login_url: S,
-                                version: S,
-                                client_id: S,
-                                client_secret: S,
-                                username: S,
-                                password: S)
-                                -> SFClientResult<SFClient> {
+    pub fn new<S: Into<String>>(
+        login_url: S,
+        version: S,
+        client_id: S,
+        client_secret: S,
+        username: S,
+        password: S,
+    ) -> SFClientResult<SFClient> {
 
         let url = login_url.into();
 
@@ -82,12 +86,14 @@ impl SFClient {
     }
 
     fn authenticate(&mut self) -> SFClientResult<()> {
-        let request = TokenRequest::new(self.login_url.as_str(),
-                                        self.client_id.as_str(),
-                                        self.client_secret.as_str(),
-                                        self.username.as_str(),
-                                        self.password.as_str(),
-                                        &self.client);
+        let request = TokenRequest::new(
+            self.login_url.as_str(),
+            self.client_id.as_str(),
+            self.client_secret.as_str(),
+            self.username.as_str(),
+            self.password.as_str(),
+            &self.client,
+        );
 
         let token_resp = request.send();
         let token = token_resp.map_err(SFClientError::Token)?;
@@ -96,51 +102,50 @@ impl SFClient {
         Ok(())
     }
 
-    fn build_request<'a, 'b>(&'a mut self,
-                             query: &'b str)
-                             -> SFClientResult<QueryRequest<'a, 'a, 'b, 'a, 'a>> {
+    fn build_request<'a, 'b>(
+        &'a mut self,
+        query: &'b str,
+    ) -> SFClientResult<QueryRequest<'a, 'a, 'b, 'a, 'a>> {
         if self.token.is_none() {
             self.authenticate()?;
         };
 
         if let Some(ref token) = self.token {
-            Ok(QueryRequest::new(token.url(),
-                                 self.version.as_str(),
-                                 query,
-                                 token.access(),
-                                 &self.client))
+            Ok(QueryRequest::new(
+                token.url(),
+                self.version.as_str(),
+                query,
+                token.access(),
+                &self.client,
+            ))
         } else {
             Err(SFClientError::TokenUnavailable)
         }
     }
 
     fn do_query(&mut self, query: &str) -> SFClientResult<QueryResponse> {
-        self.build_request(query)
-            .and_then(|request| {
-                request
-                    .send()
-                    .map_err(|failure| match failure {
-                                 QueryError::Network(net_failure) => {
-                                     SFClientError::Network(net_failure)
-                                 }
-                                 error => SFClientError::Query(error),
-                             })
+        self.build_request(query).and_then(|request| {
+            request.send().map_err(|failure| match failure {
+                QueryError::Network(net_failure) => SFClientError::Network(net_failure),
+                error => SFClientError::Query(error),
             })
+        })
     }
 
     fn attempt_query(&mut self, query: &str, attempt: u8) -> SFClientResult<QueryResponse> {
-        self.do_query(query)
-            .or_else(|err| if attempt < self.attempt_limit {
-                         if let SFClientError::Query(QueryError::API(failure)) = err {
-                             if failure.error_code == 401 {
-                                 self.token = None;
-                             }
-                         }
+        self.do_query(query).or_else(
+            |err| if attempt < self.attempt_limit {
+                if let SFClientError::Query(QueryError::API(failure)) = err {
+                    if failure.error_code == 401 {
+                        self.token = None;
+                    }
+                }
 
-                         self.attempt_query(query, attempt + 1)
-                     } else {
-                         Err(err)
-                     })
+                self.attempt_query(query, attempt + 1)
+            } else {
+                Err(err)
+            },
+        )
     }
 
     pub fn query(&mut self, query: &str) -> SFClientResult<QueryResponse> {
@@ -159,6 +164,50 @@ pub enum SFClientError {
     Query(QueryError),
     TokenUnavailable,
     Network(ClientError),
+}
+
+impl fmt::Display for SFClientError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            SFClientError::InvalidLoginUrl => {
+                write!(f, "Supplied login url is not a valid login url")
+            }
+            SFClientError::InvalidVersion => {
+                write!(f, "Supplied version is not a valid API version")
+            }
+            SFClientError::ClientBuildFailure(ref err) => err.fmt(f),
+            SFClientError::Token(ref err) => err.fmt(f),
+            SFClientError::Query(ref err) => err.fmt(f),
+            SFClientError::TokenUnavailable => write!(f, "Failed to get token from the API"),
+            SFClientError::Network(ref err) => err.fmt(f),
+        }
+    }
+}
+
+impl Error for SFClientError {
+    fn description(&self) -> &str {
+        match *self {
+            SFClientError::InvalidLoginUrl => "Supplied login url is not a valid login url",
+            SFClientError::InvalidVersion => "Supplied version is not a valid API version",
+            SFClientError::ClientBuildFailure(ref err) => err.description(),
+            SFClientError::Token(ref err) => err.description(),
+            SFClientError::Query(ref err) => err.description(),
+            SFClientError::TokenUnavailable => "Failed to get token from the API",
+            SFClientError::Network(ref err) => err.description(),
+        }
+    }
+
+    fn cause(&self) -> Option<&Error> {
+        match *self {
+            SFClientError::InvalidLoginUrl => None,
+            SFClientError::InvalidVersion => None,
+            SFClientError::ClientBuildFailure(ref err) => Some(err),
+            SFClientError::Token(ref err) => Some(err),
+            SFClientError::Query(ref err) => Some(err),
+            SFClientError::TokenUnavailable => None,
+            SFClientError::Network(ref err) => Some(err),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -199,9 +248,10 @@ mod tests {
 
     fn auth_mock(url: String, code: usize, body: String) -> Mock {
         let mut m = mock("POST", url.as_str());
-        m.with_status(code)
-            .with_body(body.as_str())
-            .match_header("content-type", "application/x-www-form-urlencoded");
+        m.with_status(code).with_body(body.as_str()).match_header(
+            "content-type",
+            "application/x-www-form-urlencoded",
+        );
         m.create();
         m
     }
@@ -235,9 +285,11 @@ mod tests {
     fn query_mock(url: String, code: usize, body: String, token: &str) -> Mock {
         let mut m = mock("GET", url.as_str());
         let auth_header = "Bearer ".to_owned() + token;
-        m.with_status(code)
-            .with_body(body.as_str())
-            .match_header("Authorization", auth_header.as_str());
+        m.with_status(code).with_body(body.as_str()).match_header(
+            "Authorization",
+            auth_header
+                .as_str(),
+        );
         m.create();
         m
     }
@@ -282,10 +334,12 @@ mod tests {
     #[test]
     fn test_authenticates_without_token() {
         let a_mock = auth_mock(auth_path("without_token"), 200, auth_success());
-        let q_mock = query_mock(query_path("without_token", "v20.0"),
-                                200,
-                                query_success(),
-                                ACCESS);
+        let q_mock = query_mock(
+            query_path("without_token", "v20.0"),
+            200,
+            query_success(),
+            ACCESS,
+        );
         let mut client = test_client!(auth_url("without_token"), 0);
 
         client.query("without_token");
@@ -300,14 +354,22 @@ mod tests {
     #[test]
     fn test_reauthenticates_with_invalid_token() {
         let a_mock = auth_mock(auth_path("invalid_token"), 200, auth_success());
-        let q_mock = query_mock(query_path("invalid_token", "v20.0"),
-                                401,
-                                query_error(),
-                                "invalid");
+        let q_mock = query_mock(
+            query_path("invalid_token", "v20.0"),
+            401,
+            query_error(),
+            "invalid",
+        );
         let mut client = test_client!(auth_url("invalid_token"), 1);
 
         let instance_url = mockito::SERVER_URL.to_owned() + "/instance/";
-        client.set_token(TokenResponse::new("invalid", "", instance_url.as_str(), "", ""));
+        client.set_token(TokenResponse::new(
+            "invalid",
+            "",
+            instance_url.as_str(),
+            "",
+            "",
+        ));
         client.query("invalid_token");
 
         a_mock.remove();
@@ -334,10 +396,12 @@ mod tests {
     #[test]
     fn test_calls_query() {
         let a_mock = auth_mock(auth_path("query_test"), 200, auth_success());
-        let q_mock = query_mock(query_path("query_test", "v20.0"),
-                                200,
-                                query_success(),
-                                ACCESS);
+        let q_mock = query_mock(
+            query_path("query_test", "v20.0"),
+            200,
+            query_success(),
+            ACCESS,
+        );
         let mut client = test_client!(auth_url("query_test"), 0);
 
         let res = client.query("query_test");

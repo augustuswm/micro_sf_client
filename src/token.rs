@@ -4,6 +4,8 @@ use reqwest::{Client, Error as ClientError, RequestBuilder};
 
 use std::cmp::PartialEq;
 use std::collections::HashMap;
+use std::error::Error;
+use std::fmt;
 use std::io::Read;
 
 #[derive(Debug)]
@@ -19,8 +21,8 @@ pub struct TokenRequest<'a, 'b, 'c, 'd, 'e, 'f> {
 impl<'a, 'b, 'c, 'd, 'e, 'f> PartialEq for TokenRequest<'a, 'b, 'c, 'd, 'e, 'f> {
     fn eq(&self, other: &TokenRequest) -> bool {
         self.login_url == other.login_url && self.client_id == other.client_id &&
-        self.client_secret == other.client_secret && self.username == other.username &&
-        self.password == other.password
+            self.client_secret == other.client_secret && self.username == other.username &&
+            self.password == other.password
     }
 }
 
@@ -50,6 +52,20 @@ pub enum AuthFailure {
     TokenUnavailable,
 }
 
+impl fmt::Display for AuthFailure {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            AuthFailure::InvalidClientId => write!(f, "Invalid client id"),
+            AuthFailure::InvalidClientSecret => write!(f, "Invalid client secret"),
+            AuthFailure::InvalidGrant => write!(f, "Invalid grant type"),
+            AuthFailure::InvalidUser => write!(f, "Invalid username"),
+            AuthFailure::OrgUnavailable => write!(f, "Invalid password"),
+            AuthFailure::RateLimitExceeded => write!(f, "API rate limit has been exceeded"),
+            AuthFailure::TokenUnavailable => write!(f, "Failed to get token for unknown reason"),
+        }
+    }
+}
+
 impl<'a> From<&'a str> for AuthFailure {
     fn from(val: &'a str) -> AuthFailure {
         match val {
@@ -64,23 +80,15 @@ impl<'a> From<&'a str> for AuthFailure {
     }
 }
 
-#[derive(Debug)]
-pub enum TokenError {
-    AuthResponseParseFailure,
-    APIError(AuthFailure),
-    Network(ClientError),
-}
-
-pub type TokenResult = Result<TokenResponse, TokenError>;
-
 impl<'a, 'b, 'c, 'd, 'e, 'f> TokenRequest<'a, 'b, 'c, 'd, 'e, 'f> {
-    pub fn new(login_url: &'a str,
-               client_id: &'b str,
-               client_secret: &'c str,
-               username: &'d str,
-               password: &'e str,
-               client: &'f Client)
-               -> TokenRequest<'a, 'b, 'c, 'd, 'e, 'f> {
+    pub fn new(
+        login_url: &'a str,
+        client_id: &'b str,
+        client_secret: &'c str,
+        username: &'d str,
+        password: &'e str,
+        client: &'f Client,
+    ) -> TokenRequest<'a, 'b, 'c, 'd, 'e, 'f> {
         TokenRequest {
             login_url: login_url,
             client_id: client_id,
@@ -110,9 +118,13 @@ impl<'a, 'b, 'c, 'd, 'e, 'f> TokenRequest<'a, 'b, 'c, 'd, 'e, 'f> {
 
         if let Ok(token) = serde_json::from_str::<TokenResponse>(content.as_str()) {
             Ok(token)
-        } else if let Ok(token_error) =
-            serde_json::from_str::<TokenErrorResponse>(content.as_str()) {
-            Err(TokenError::APIError(AuthFailure::from(token_error.error.as_str())))
+        } else if let Ok(token_error) = serde_json::from_str::<TokenErrorResponse>(
+            content.as_str(),
+        )
+        {
+            Err(TokenError::APIError(
+                AuthFailure::from(token_error.error.as_str()),
+            ))
         } else {
             Err(TokenError::AuthResponseParseFailure)
         }
@@ -120,12 +132,13 @@ impl<'a, 'b, 'c, 'd, 'e, 'f> TokenRequest<'a, 'b, 'c, 'd, 'e, 'f> {
 }
 
 impl TokenResponse {
-    pub fn new(access_token: &str,
-               token_type: &str,
-               instance_url: &str,
-               signature: &str,
-               issued_at: &str)
-               -> TokenResponse {
+    pub fn new(
+        access_token: &str,
+        token_type: &str,
+        instance_url: &str,
+        signature: &str,
+        issued_at: &str,
+    ) -> TokenResponse {
         TokenResponse {
             access_token: access_token.to_string(),
             token_type: token_type.to_string(),
@@ -141,6 +154,44 @@ impl TokenResponse {
 
     pub fn access(&self) -> &str {
         self.access_token.as_str()
+    }
+}
+
+#[derive(Debug)]
+pub enum TokenError {
+    AuthResponseParseFailure,
+    APIError(AuthFailure),
+    Network(ClientError),
+}
+
+pub type TokenResult = Result<TokenResponse, TokenError>;
+
+impl fmt::Display for TokenError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            TokenError::AuthResponseParseFailure => {
+                write!(f, "Failed to parse the token response from the API")
+            }
+            TokenError::APIError(ref failure) => write!(f, "{}", failure),
+            TokenError::Network(ref err) => err.fmt(f),
+        }
+    }
+}
+
+impl Error for TokenError {
+    fn description(&self) -> &str {
+        match *self {
+            TokenError::AuthResponseParseFailure => "auth_response_parse_failed",
+            TokenError::APIError(_) => "auth_failure",
+            TokenError::Network(ref err) => err.description(),
+        }
+    }
+
+    fn cause(&self) -> Option<&Error> {
+        match *self {
+            TokenError::Network(ref err) => Some(err),
+            _ => None,
+        }
     }
 }
 
@@ -181,9 +232,10 @@ mod tests {
 
     fn auth_mock(url: String, code: usize, body: String) -> Mock {
         let mut m = mock("POST", url.as_str());
-        m.with_status(code)
-            .with_body(body.as_str())
-            .match_header("content-type", "application/x-www-form-urlencoded");
+        m.with_status(code).with_body(body.as_str()).match_header(
+            "content-type",
+            "application/x-www-form-urlencoded",
+        );
         m.create();
         m
     }
